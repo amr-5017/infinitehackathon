@@ -1,5 +1,107 @@
-Code for openCV and mediapiep integration:
+# PC Code
+# OpenCV code with Socket connection to the Pynq-z2
 
+
+import cv2
+import socket
+import pickle
+import struct
+from pynput.keyboard import Controller
+
+# Initialize the keyboard controller
+keyboard = Controller()
+
+# Define a mapping from gestures to keyboard keys
+gesture_key_mapping = {
+    "Thumbs Up": 'w',       # Example: 'w' key for "Thumbs Up" gesture
+    "Open Hand": 's',       # Example: 's' key for "Open Hand" gesture
+    "Peace": 'a',           # Example: 'a' key for "Peace" gesture
+    "Okay": 'd'             # Example: 'd' key for "Okay" gesture
+}
+
+# Initialize socket connection
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket.connect(('PYNQ-Z2_IP_ADDRESS', 9999))  # Replace with the PYNQ-Z2's IP address and available port number on the PYNQ board
+
+# Capture video from the webcam
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Serialize the frame and send it over the socket
+    data = pickle.dumps(frame)
+    message = struct.pack("Q", len(data)) + data
+    client_socket.sendall(message)
+
+    # Wait to receive the processed frame back from PYNQ-Z2
+    data = b""
+    payload_size = struct.calcsize("Q")
+    
+    while len(data) < payload_size:
+        packet = client_socket.recv(4*1024)  # 4KB frame buffer
+        if not packet:
+            break
+        data += packet
+    
+    packed_msg_size = data[:payload_size]
+    data = data[payload_size:]
+    msg_size = struct.unpack("Q", packed_msg_size)[0]
+    
+    while len(data) < msg_size:
+        data += client_socket.recv(4*1024)
+    
+    processed_frame_data = data[:msg_size]
+    processed_frame = pickle.loads(processed_frame_data)
+
+    # Assume the gesture is written on the frame in a corner (as done in the PYNQ-Z2 code)
+    # Extract the gesture from the frame (for this example, assume it's at position (10, 30))
+    gesture = "Extracted_Gesture_From_Frame"  # This should be the recognized gesture text
+
+    # Map the gesture to a keyboard key and simulate the keypress
+    if gesture in gesture_key_mapping:
+        key = gesture_key_mapping[gesture]
+        keyboard.press(key)
+        keyboard.release(key)
+    
+    # Display the processed frame received from PYNQ-Z2
+    cv2.imshow('Processed Frame from PYNQ-Z2 on PC', processed_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+client_socket.close()
+cv2.destroyAllWindows()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# PYNQ-Z2 code
+# code for the PynQ-z2 board with bidirectional connection with my pc
+
+import socket
+import pickle
+import struct
 import cv2
 import mediapipe as mp
 
@@ -8,34 +110,109 @@ mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.5)
 mp_draw = mp.solutions.drawing_utils
 
-# Capture video input
-cap = cv2.VideoCapture(0)
+# Set up the socket server
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.bind(('0.0.0.0', 9999))  # Listen on all available interfaces
+server_socket.listen(5)
+print('Waiting for a connection...')
+
+conn, addr = server_socket.accept()
+print(f'Connected to {addr}')
+
+data = b""
+payload_size = struct.calcsize("Q")
+
+def recognize_gesture(hand_landmarks):
+    landmarks = hand_landmarks.landmark
+
+    # Thumb
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+
+    # Fingers
+    index_finger_tip = landmarks[8]
+    middle_finger_tip = landmarks[12]
+    ring_finger_tip = landmarks[16]
+    pinky_finger_tip = landmarks[20]
+
+    # Check "Thumbs Up"
+    thumb_up = thumb_tip.y < thumb_ip.y
+
+    # Check "Open Hand"
+    all_fingers_up = (
+        index_finger_tip.y < landmarks[6].y and
+        middle_finger_tip.y < landmarks[10].y and
+        ring_finger_tip.y < landmarks[14].y and
+        pinky_finger_tip.y < landmarks[18].y
+    )
+
+    # Check "Two Finger Peace Sign"
+    two_finger_peace = (
+        index_finger_tip.y < landmarks[6].y and
+        middle_finger_tip.y < landmarks[10].y and
+        ring_finger_tip.y > landmarks[14].y and
+        pinky_finger_tip.y > landmarks[18].y
+    )
+
+    # Check "Okay Sign"
+    thumb_index_close = (abs(thumb_tip.x - index_finger_tip.x) < 0.05 and
+                         abs(thumb_tip.y - index_finger_tip.y) < 0.05)
+    three_fingers_up = (
+        middle_finger_tip.y < landmarks[10].y and
+        ring_finger_tip.y < landmarks[14].y and
+        pinky_finger_tip.y < landmarks[18].y
+    )
+
+    if thumb_up and not all_fingers_up:
+        return "Thumbs Up"
+    elif all_fingers_up:
+        return "Open Hand"
+    elif two_finger_peace:
+        return "Peace"
+    elif thumb_index_close and three_fingers_up:
+        return "Okay"
+    
+    return "Unknown"
 
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    while len(data) < payload_size:
+        packet = conn.recv(4*1024)  # 4KB frame buffer
+        if not packet:
+            break
+        data += packet
 
-    # Flip the frame horizontally for a mirror effect
-    frame = cv2.flip(frame, 1)
+    packed_msg_size = data[:payload_size]
+    data = data[payload_size:]
+    msg_size = struct.unpack("Q", packed_msg_size)[0]
 
-    # Convert the frame to RGB
+    while len(data) < msg_size:
+        data += conn.recv(4*1024)
+
+    frame_data = data[:msg_size]
+    data = data[msg_size:]
+
+    frame = pickle.loads(frame_data)
+
+    # Process the frame with MediaPipe
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    # Process the frame and detect hands
     results = hands.process(rgb_frame)
 
-    # Draw hand landmarks
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
             mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            gesture = recognize_gesture(hand_landmarks)
+            cv2.putText(frame, gesture, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-    # Display the result
-    cv2.imshow('Hand Recognition', frame)
+    # Serialize the processed frame and send it back to the PC
+    processed_data = pickle.dumps(frame)
+    message = struct.pack("Q", len(processed_data)) + processed_data
+    conn.sendall(message)
+    
+    cv2.imshow('Processed Frame on PYNQ-Z2', frame)
 
-    # Break the loop if 'q' is pressed
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-cap.release()
+conn.close()
+server_socket.close()
 cv2.destroyAllWindows()
